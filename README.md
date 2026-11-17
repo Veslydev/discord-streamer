@@ -89,6 +89,32 @@ Your tokens are verified with Discord's API and saved locally to `.env`.
 
 ---
 
+## Running with Bun + PM2
+
+Install [Bun](https://bun.sh/) and PM2, then run:
+
+```bash
+bun install
+pm2 start ecosystem.config.cjs
+pm2 save
+```
+
+Configure `.env` using `.env.example` before starting. If configuration is missing,
+the PM2 process stops instead of opening the interactive wizard or restarting repeatedly.
+After filling in `.env`, run:
+
+```bash
+pm2 restart discord-streamer
+pm2 logs discord-streamer
+```
+
+On Linux, the prebuilt WebRTC addon may require a newer GLIBC than the host
+provides. In that case, build `@lng2004/node-datachannel` from source for the host
+before starting. A local build inside `node_modules` must be rebuilt if that
+directory is removed.
+
+---
+
 ## 🐳 Running with Docker
 
 To run continuously in the background on a server or VPS:

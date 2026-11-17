@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { Streamer } from "@dank074/discord-video-stream";
+import { MutedStreamer, leaveVoiceAndWait, joinVoiceWithTimeout } from "./voice.js";
 
 const VoiceOpCodes = {
   IDENTIFY: 0,
@@ -134,11 +134,12 @@ export class WatcherManager {
     this.channelId = channelId;
     this.dashboard = dashboard;
 
-    this.streamer = new Streamer(client);
+    this.streamer = new MutedStreamer(client);
     this.activeSessions = new Map(); // streamKey -> StreamWatchSession
     this.pendingData = new Map(); // streamKey -> { rtcServerId, endpoint, token }
     this.sessionId = null;
     this.isRunning = false;
+    this.isJoining = false;
 
     this.setupListeners();
   }
@@ -181,20 +182,26 @@ export class WatcherManager {
   }
 
   async start() {
+    if (this.isJoining) return;
     this.isRunning = true;
+    this.isJoining = true;
     try {
       this.dashboard?.setViewerStatus("Joining channel (WebRTC)...");
-      try {
-        this.streamer.leaveVoice();
-      } catch {}
-      await this.streamer.joinVoice(this.guildId, this.channelId);
+      this.clearStreamSessions();
+      await leaveVoiceAndWait(this.streamer);
+      await joinVoiceWithTimeout(this.streamer, this.guildId, this.channelId);
       this.sessionId = this.streamer.voiceConnection?.session_id || this.sessionId;
       this.dashboard?.setViewerStatus("In channel");
       this.dashboard?.addLog("Viewer joined voice channel (WebRTC active)", "success");
     } catch (err) {
+      try {
+        await leaveVoiceAndWait(this.streamer);
+      } catch {}
       this.dashboard?.setViewerStatus("Voice error");
       this.dashboard?.addLog(`Viewer voice connection failed: ${err.message}`, "error");
       throw err;
+    } finally {
+      this.isJoining = false;
     }
   }
 
@@ -220,11 +227,13 @@ export class WatcherManager {
       userId: this.client.user.id,
       sessionId,
       onReady: (key) => {
+        if (this.activeSessions.get(key) !== session) return;
         const username = key.split(":").pop();
         this.dashboard?.addLog(`Viewer watching stream: ${username} (RTC connected)`, "success");
         this.updateDashboardStatus();
       },
       onClose: (key) => {
+        if (this.activeSessions.get(key) !== session) return;
         this.activeSessions.delete(key);
         this.updateDashboardStatus();
 
@@ -246,8 +255,7 @@ export class WatcherManager {
   watchStream(streamKey) {
     if (!this.isRunning) return;
 
-    if (!this.streamer.voiceConnection || !this.streamer.voiceConnection.status?.started) {
-      this.dashboard?.addLog("Viewer not in voice yet, deferring stream watch...", "warn");
+    if (!this.isVoiceReady()) {
       return;
     }
 
@@ -287,13 +295,22 @@ export class WatcherManager {
     return Array.from(this.activeSessions.values()).filter((s) => s.isReady).length;
   }
 
+  isVoiceReady() {
+    const connection = this.streamer.voiceConnection;
+    return !!(connection?.status?.started && connection.ws?.readyState === 1 && connection.webRtcConn?.ready);
+  }
+
+  clearStreamSessions() {
+    this.pendingData.clear();
+    const sessions = [...this.activeSessions.values()];
+    this.activeSessions.clear();
+    this.sessionId = null;
+    for (const session of sessions) session.stop();
+  }
+
   stop() {
     this.isRunning = false;
-    for (const [, session] of this.activeSessions.entries()) {
-      session.stop();
-    }
-    this.activeSessions.clear();
-    this.pendingData.clear();
+    this.clearStreamSessions();
     try {
       this.streamer?.leaveVoice();
     } catch {}

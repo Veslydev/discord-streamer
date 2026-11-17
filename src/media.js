@@ -6,6 +6,21 @@ import ffmpegStatic from "ffmpeg-static";
 
 const execFileAsync = promisify(execFile);
 
+export function getStreamMediaOptions({ FPS, BITRATE_KBPS } = {}) {
+  const bitrate = Math.max(BITRATE_KBPS || 150, 100);
+  return {
+    videoCodec: "H264",
+    bitrateVideo: bitrate,
+    bitrateVideoMax: bitrate + 50,
+    frameRate: Math.max(FPS || 10, 5),
+    width: 480,
+    height: 270,
+    includeAudio: true,
+    // Pace file ingestion to avoid node-av's busy-wait on a full packet queue.
+    customInputOptions: ["-re", "-stream_loop", "-1"],
+  };
+}
+
 export function injectFFmpegPath() {
   let ffmpegBin = ffmpegStatic;
 

@@ -31,6 +31,10 @@ export async function loadConfig() {
     CHANNEL_ID.trim() === "";
 
   if (isConfigIncomplete) {
+    if (!process.stdin.isTTY) {
+      console.error("Missing configuration. Fill in .env (see .env.example), then restart the process.");
+      process.exit(78);
+    }
     return await runSetupWizard();
   }
 

@@ -66,10 +66,14 @@ export class Dashboard {
     if (this.logs.length > this.maxLogs) {
       this.logs.pop();
     }
+    if (!process.stdout.isTTY) {
+      console.log(this.logs[0]);
+    }
     this.render();
   }
 
   render() {
+    if (!process.stdout.isTTY) return;
     const isMultiStreamer = this.streamers.length > 1;
 
     let streamerContent = [];

@@ -1,6 +1,7 @@
 import { Client } from "@lng2004/discord.js-selfbot-v13";
-import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stream";
-import { ensureDummyMedia, injectFFmpegPath } from "./media.js";
+import { prepareStream, playStream } from "@dank074/discord-video-stream";
+import { MutedStreamer, leaveVoiceAndWait, joinVoiceWithTimeout, waitForStreamReady } from "./voice.js";
+import { ensureDummyMedia, injectFFmpegPath, getStreamMediaOptions } from "./media.js";
 import { loadStats, saveStats, detectProfileStreamingBadge } from "./storage.js";
 import { TelemetryService } from "./telemetry.js";
 import { WatcherManager } from "./watcher.js";
@@ -32,7 +33,7 @@ export class StreamEngine {
         user: s.user,
         token: s.token,
         client: client,
-        streamer: new Streamer(client),
+        streamer: new MutedStreamer(client),
         telemetry: new TelemetryService(s.token, s.user),
         isStreaming: false,
         isStartingBroadcast: false,
@@ -95,6 +96,8 @@ export class StreamEngine {
 
       streamer.client.on("voiceStateUpdate", (oldState, newState) => {
         if (!this.isRunning || newState.id !== streamer.user.id) return;
+        // A reconnect deliberately leaves first; its acknowledgement is not a new failure.
+        if (streamer.isStartingBroadcast) return;
 
         if (!newState.channelId) {
           this.dashboard.addLog(`Streamer ${streamer.user.username} disconnected! Rejoining in 5s...`, "warn");
@@ -124,6 +127,7 @@ export class StreamEngine {
 
     this.viewerClient.on("voiceStateUpdate", (oldState, newState) => {
       if (!this.isRunning || newState.id !== this.viewerClient.user?.id) return;
+      if (this.viewerManager.isJoining) return;
 
       if (!newState.channelId) {
         this.dashboard.addLog("Viewer disconnected from voice! Rejoining in 5s...", "warn");
@@ -147,38 +151,47 @@ export class StreamEngine {
       }
     }, 5 * 60 * 1000);
 
-    this.streamWatchdogTimer = setInterval(() => {
-      if (!this.isRunning) return;
-
-      for (const streamer of this.streamers) {
-        if (streamer.isStreaming && !streamer.isStartingBroadcast && !streamer.reconnectTimer) {
-          const streamConn = streamer.streamer?.voiceConnection?.streamConnection;
-          const isStreamDead = !streamConn || (streamConn.ws && streamConn.ws.readyState > 1);
-          const isVoiceDead = !streamer.streamer?.voiceConnection || streamer.streamer?.voiceConnection?.status?.started === false;
-
-          if (isStreamDead || isVoiceDead) {
-            this.dashboard.addLog(`Stream watchdog: ${streamer.user.username} stream stalled! Recovering...`, "warn");
-            streamer.isStreaming = false;
-            if (streamer.streamCancelController) {
-              streamer.streamCancelController.abort();
-            }
-            this.scheduleStreamerReconnect(streamer, 2000);
-          }
-        }
-      }
-
-      const activeStreamers = this.streamers.filter((s) => s.isStreaming && s.client.user);
-      const watchingCount = this.viewerManager.getWatchingCount();
-      if (activeStreamers.length > 0 && watchingCount < activeStreamers.length) {
-        this.triggerViewerWatch();
-      }
-    }, 10000);
+    this.streamWatchdogTimer = setInterval(() => this.checkConnections(), 10000);
 
     const logins = [
       ...this.streamers.map((s) => s.client.login(s.token)),
       this.viewerClient.login(this.config.VIEWER_TOKEN),
     ];
     await Promise.all(logins);
+  }
+
+  checkConnections() {
+    if (!this.isRunning) return;
+
+    for (const streamer of this.streamers) {
+      if (streamer.isStreaming && !streamer.isStartingBroadcast && !streamer.reconnectTimer) {
+        const voiceConn = streamer.streamer?.voiceConnection;
+        if (voiceConn?.awaitingVoiceServer) continue;
+        const streamConn = voiceConn?.streamConnection;
+        const isStreamDead = !streamConn || (streamConn.ws && streamConn.ws.readyState > 1);
+        const isVoiceDead = !voiceConn || voiceConn.status?.started === false;
+
+        if (isStreamDead || isVoiceDead) {
+          this.dashboard.addLog(`Stream watchdog: ${streamer.user.username} stream stalled! Recovering...`, "warn");
+          streamer.isStreaming = false;
+          streamer.streamCancelController?.abort();
+          this.scheduleStreamerReconnect(streamer, 2000);
+        }
+      }
+    }
+
+    const viewerWaitingForServer = this.viewerManager.streamer.voiceConnection?.awaitingVoiceServer;
+    if (!this.viewerManager.isJoining && !this.viewerReconnectTimer && !viewerWaitingForServer &&
+        !this.viewerManager.isVoiceReady()) {
+      this.dashboard.addLog("Viewer watchdog: voice connection lost. Reconnecting...", "warn");
+      this.dashboard.setViewerStatus("Reconnecting...");
+      this.scheduleViewerReconnect(5000, true);
+    }
+
+    const activeStreamers = this.streamers.filter((s) => s.isStreaming && s.client.user);
+    if (this.viewerManager.isVoiceReady() && this.viewerManager.getWatchingCount() < activeStreamers.length) {
+      this.triggerViewerWatch();
+    }
   }
 
   scheduleStreamerReconnect(streamer, delayMs = 5000) {
@@ -198,7 +211,7 @@ export class StreamEngine {
     }, delayMs);
   }
 
-  scheduleViewerReconnect(delayMs = 5000) {
+  scheduleViewerReconnect(delayMs = 5000, onlyIfUnhealthy = false) {
     if (!this.isRunning) return;
 
     if (this.viewerReconnectTimer) {
@@ -208,6 +221,8 @@ export class StreamEngine {
 
     this.viewerReconnectTimer = setTimeout(() => {
       this.viewerReconnectTimer = null;
+      if (this.viewerManager.streamer.voiceConnection?.awaitingVoiceServer) return;
+      if (onlyIfUnhealthy && this.viewerManager.isVoiceReady()) return;
       if (this.isRunning) {
         this.startViewerWatcher();
       }
@@ -235,8 +250,13 @@ export class StreamEngine {
   async startStreamerBroadcast(streamer) {
     if (!this.isRunning || streamer.isStartingBroadcast) return;
     streamer.isStartingBroadcast = true;
+    const previousController = streamer.streamCancelController;
+    const controller = new AbortController();
+    streamer.streamCancelController = controller;
+    previousController?.abort();
+    const isCurrentAttempt = () => streamer.streamCancelController === controller;
 
-    const { GUILD_ID, CHANNEL_ID, FPS, BITRATE_KBPS } = this.config;
+    const { GUILD_ID, CHANNEL_ID } = this.config;
 
     try {
       if (streamer.reconnectTimer) {
@@ -244,88 +264,96 @@ export class StreamEngine {
         streamer.reconnectTimer = null;
       }
 
-      if (streamer.streamCancelController) {
-        streamer.streamCancelController.abort();
-      }
-
-      streamer.streamCancelController = null;
-
-      try {
-        streamer.streamer?.stopStream();
-        streamer.streamer?.leaveVoice();
-      } catch {}
+      streamer.isStreaming = false;
+      streamer.streamer.stopStream();
+      await leaveVoiceAndWait(streamer.streamer);
+      controller.signal.throwIfAborted();
+      if (!isCurrentAttempt()) return;
 
       streamer.status = "Joining channel...";
       this.syncDashboardStreamers();
 
-      const joinTimeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Voice join timed out after 20s")), 20000)
-      );
-      await Promise.race([
-        streamer.streamer.joinVoice(GUILD_ID, CHANNEL_ID),
-        joinTimeout,
-      ]);
+      await joinVoiceWithTimeout(streamer.streamer, GUILD_ID, CHANNEL_ID);
+      controller.signal.throwIfAborted();
+      if (!isCurrentAttempt()) return;
 
-      const effectiveFps = Math.max(FPS || 10, 5);
-      const effectiveBitrate = Math.max(BITRATE_KBPS || 150, 100);
+      const mediaOptions = getStreamMediaOptions(this.config);
+      const streamMedia = prepareStream(this.dummyVideoPath, mediaOptions, controller.signal);
+      // Observe FFmpeg errors immediately, including while telemetry is still starting.
+      streamMedia.promise.catch(() => {});
 
-      const streamMedia = prepareStream(this.dummyVideoPath, {
-        videoCodec: "H264",
-        bitrateVideo: effectiveBitrate,
-        bitrateVideoMax: effectiveBitrate + 50,
-        frameRate: effectiveFps,
-        width: 480,
-        height: 270,
-        includeAudio: true,
-        customInputOptions: ["-stream_loop", "-1"],
-      });
-
-      streamer.streamCancelController = new AbortController();
-      streamer.isStreaming = true;
-      streamer.isStartingBroadcast = false;
-      streamer.status = "Broadcasting";
+      streamer.status = "Starting stream...";
       this.syncDashboardStreamers();
 
-      await streamer.telemetry.onStreamStarted(GUILD_ID, CHANNEL_ID);
-      this.dashboard.addLog(`Stream active: ${streamer.user.username}`, "success");
-      this.triggerViewerWatch();
-
-      await playStream(
+      const playback = playStream(
         streamMedia.output,
         streamer.streamer,
         {
           type: "go-live",
           width: 480,
           height: 270,
-          frameRate: effectiveFps,
+          frameRate: mediaOptions.frameRate,
         },
-        streamer.streamCancelController.signal
+        controller.signal
       );
+      await Promise.race([
+        waitForStreamReady(streamer.streamer, controller.signal),
+        playback.then(() => { throw new Error("Stream ended before WebRTC was ready"); }),
+        streamMedia.promise.then(() => { throw new Error("FFmpeg ended before WebRTC was ready"); }),
+      ]);
+      controller.signal.throwIfAborted();
+      if (!isCurrentAttempt()) return;
 
+      streamer.isStreaming = true;
+      streamer.isStartingBroadcast = false;
+      streamer.status = "Broadcasting";
+      this.syncDashboardStreamers();
+      await streamer.telemetry.onStreamStarted(GUILD_ID, CHANNEL_ID);
+      controller.signal.throwIfAborted();
+      if (!isCurrentAttempt()) return;
+      this.dashboard.addLog(`Stream active: ${streamer.user.username} (WebRTC connected)`, "success");
+      this.triggerViewerWatch();
+
+      await Promise.race([playback, streamMedia.promise]);
+
+      if (!isCurrentAttempt()) return;
       streamer.isStreaming = false;
-      const wasAborted = streamer.streamCancelController?.signal?.aborted;
+      const wasAborted = controller.signal.aborted;
       if (!wasAborted && this.isRunning) {
         this.dashboard.addLog(`Stream cycle completed (${streamer.user.username}). Restarting...`, "info");
         try {
           await streamer.telemetry.onStreamEnded(GUILD_ID, CHANNEL_ID);
         } catch {}
+        if (!isCurrentAttempt()) return;
         const streamKey = `guild:${GUILD_ID}:${CHANNEL_ID}:${streamer.user.id}`;
         this.viewerManager.stopSession(streamKey);
 
         this.scheduleStreamerReconnect(streamer, 2000);
       }
     } catch (err) {
-      streamer.isStartingBroadcast = false;
+      if (!isCurrentAttempt()) return;
       streamer.isStreaming = false;
+      const wasAborted = controller.signal.aborted;
+
+      // Keep disconnect handling suppressed until the failed connection is gone.
+      streamer.isStartingBroadcast = true;
+      controller.abort();
+      try {
+        await leaveVoiceAndWait(streamer.streamer);
+      } catch (cleanupError) {
+        this.dashboard.addLog(`Voice cleanup: ${cleanupError.message}`, "warn");
+      }
+      if (!isCurrentAttempt()) return;
 
       try {
         await streamer.telemetry.onStreamEnded(GUILD_ID, CHANNEL_ID);
       } catch {}
+      if (!isCurrentAttempt()) return;
 
       const streamKey = `guild:${GUILD_ID}:${CHANNEL_ID}:${streamer.user.id}`;
       this.viewerManager.stopSession(streamKey);
 
-      const wasAborted = streamer.streamCancelController?.signal?.aborted;
+      streamer.isStartingBroadcast = false;
       if (!wasAborted && this.isRunning) {
         this.dashboard.addLog(`Stream error (${streamer.user.username}): ${err.message}`, "warn");
         streamer.status = "Reconnecting...";
@@ -333,6 +361,12 @@ export class StreamEngine {
         this.scheduleStreamerReconnect(streamer, 10000);
       }
       this.triggerViewerWatch();
+    } finally {
+      // Each attempt owns its FFmpeg process, even after a newer attempt takes over.
+      controller.abort();
+      if (isCurrentAttempt()) {
+        streamer.isStartingBroadcast = false;
+      }
     }
   }
 

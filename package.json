@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "start:bun": "bun src/index.js"
   },
   "keywords": [
     "discord",
@@ -17,6 +18,11 @@
   ],
   "author": "lawerth",
   "license": "MIT",
+  "trustedDependencies": [
+    "ffmpeg-static",
+    "node-av",
+    "zeromq"
+  ],
   "dependencies": {
     "@dank074/discord-video-stream": "^7.0.0",
     "@lng2004/discord.js-selfbot-v13": "^3.7.2",
