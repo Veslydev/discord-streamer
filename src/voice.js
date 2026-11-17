@@ -1,18 +1,28 @@
 import { Streamer } from "@dank074/discord-video-stream";
+import { ConnectionHealth } from "./connection-health.js";
 
 // Upstream accepts null endpoints and resumes sockets even after stop().
-export function guardVoiceConnection(connection, onClose) {
+export function guardVoiceConnection(connection, onClose, onRecovered) {
   if (!connection || connection.lifecycleGuarded) return;
   connection.lifecycleGuarded = true;
   connection.awaitingVoiceServer = false;
   let stopped = false;
   let serverUpdate = 0;
   let closing = null;
+  let retryTimer = null;
+  let retries = 0;
+  const health = new ConnectionHealth(connection, {
+    onClose,
+    onRecovered: () => { retries = 0; onRecovered?.(); },
+  });
+  connection.transportHealth = health;
   const start = connection.start.bind(connection);
   const stop = connection.stop.bind(connection);
   const setTokens = connection.setTokens.bind(connection);
 
   const closeTransport = () => {
+    clearTimeout(retryTimer);
+    retryTimer = null;
     connection.status.started = false;
     connection.status.resuming = false;
     clearInterval(connection.interval);
@@ -26,21 +36,36 @@ export function guardVoiceConnection(connection, onClose) {
     stop();
   };
 
-  connection.start = () => {
-    if (stopped || connection.awaitingVoiceServer || !connection.server || !connection.token) return;
+  const startTransport = () => {
+    if (stopped || connection.awaitingVoiceServer || !connection.server || !connection.token || health.failure) return;
     const oldSocket = connection.ws;
     const result = start();
     if (connection.ws && connection.ws !== oldSocket) {
-      connection.ws.addEventListener("close", (event) => {
-        if (!stopped && !connection.awaitingVoiceServer) onClose?.(event.code);
-      }, { once: true });
+      health.watch(connection.ws);
     }
     return result;
+  };
+
+  connection.start = () => {
+    if (stopped || connection.awaitingVoiceServer || !connection.server || !connection.token || health.failure) return;
+    if (connection.status.resuming && !connection.status.started) {
+      if (!retryTimer) {
+        const delay = Math.min(1000 * 2 ** Math.min(retries++, 4), 10000);
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          startTransport();
+        }, delay);
+        retryTimer.unref?.();
+      }
+      return;
+    }
+    return startTransport();
   };
 
   connection.stop = () => {
     stopped = true;
     serverUpdate++;
+    health.stop();
     closeTransport();
   };
 
@@ -49,6 +74,7 @@ export function guardVoiceConnection(connection, onClose) {
     const update = ++serverUpdate;
     if (!server || !token) {
       connection.awaitingVoiceServer = true;
+      health.waitForServer();
       connection.status.hasToken = false;
       connection.server = null;
       connection.token = null;
@@ -154,13 +180,17 @@ export class MutedStreamer extends Streamer {
         }
       });
     }
-    guardVoiceConnection(this.voiceConnection, (code) => this.onConnectionClose?.("voice", code));
+    guardVoiceConnection(this.voiceConnection,
+      (code) => this.onConnectionClose?.("voice", code, "closed"),
+      () => this.onConnectionClose?.("voice", null, "recovered"));
     return joining;
   }
 
   createStream() {
     const creating = super.createStream();
-    guardVoiceConnection(this.voiceConnection?.streamConnection, (code) => this.onConnectionClose?.("stream", code));
+    guardVoiceConnection(this.voiceConnection?.streamConnection,
+      (code) => this.onConnectionClose?.("stream", code, "closed"),
+      () => this.onConnectionClose?.("stream", null, "recovered"));
     return creating;
   }
 

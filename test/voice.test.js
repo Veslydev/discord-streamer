@@ -238,3 +238,44 @@ test("another guild or channel cannot overwrite the voice transport session", ()
   expect(streamer.voiceConnection.session_id).toBe("correct-session");
   streamer.leaveVoice();
 });
+
+test("socket resumes are delayed and stopping cancels a pending resume", async () => {
+  function createResumingConnection() {
+    let starts = 0;
+    const connection = {
+      status: { started: false, resuming: false },
+      server: "voice.example", token: "test-token",
+      start() {
+        starts++;
+        this.status.started = true;
+        this.ws = new EventTarget();
+        this.ws.readyState = 1;
+        this.ws.addEventListener("close", () => {
+          const wasStarted = this.status.started;
+          this.status.started = false;
+          if (wasStarted) {
+            this.status.resuming = true;
+            this.start();
+          }
+        });
+      },
+      stop() {}, setTokens() {},
+    };
+    guardVoiceConnection(connection);
+    connection.start();
+    const event = new Event("close");
+    event.code = 1006;
+    connection.ws.readyState = 3;
+    connection.ws.dispatchEvent(event);
+    return { connection, starts: () => starts };
+  }
+  const retrying = createResumingConnection();
+  const stopped = createResumingConnection();
+  stopped.connection.stop();
+  expect(retrying.starts()).toBe(1);
+  expect(stopped.starts()).toBe(1);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  expect(retrying.starts()).toBe(2);
+  expect(stopped.starts()).toBe(1);
+  retrying.connection.stop();
+});

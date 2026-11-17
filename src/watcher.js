@@ -1,21 +1,9 @@
-import WebSocket from "ws";
-import { MutedStreamer, leaveVoiceAndWait, joinVoiceWithTimeout } from "./voice.js";
-
-const VoiceOpCodes = {
-  IDENTIFY: 0,
-  SELECT_PROTOCOL: 1,
-  READY: 2,
-  HEARTBEAT: 3,
-  SESSION_DESCRIPTION: 4,
-  SPEAKING: 5,
-  HEARTBEAT_ACK: 6,
-  RESUME: 7,
-  HELLO: 8,
-  RESUMED: 9,
-};
+import { StreamConnection } from "@dank074/discord-video-stream";
+import { MutedStreamer, guardVoiceConnection, leaveVoiceAndWait, joinVoiceWithTimeout } from "./voice.js";
+import { isMediaConnectionReady, shouldReconnectMedia } from "./connection-health.js";
 
 export class StreamWatchSession {
-  constructor({ streamKey, endpoint, token, rtcServerId, userId, sessionId, onReady, onClose }) {
+  constructor({ streamer, streamKey, endpoint, token, rtcServerId, userId, sessionId, onReady, onClose, onTransportEvent }) {
     this.streamKey = streamKey;
     this.endpoint = endpoint.replace(":443", "");
     this.token = token;
@@ -25,105 +13,63 @@ export class StreamWatchSession {
     this.onReady = onReady;
     this.onClose = onClose;
 
-    this.ws = null;
-    this.heartbeatTimer = null;
-    this.isReady = false;
+    this.healthTimer = null;
+    this.readyReported = false;
     this.isClosed = false;
+    const [, guildId, channelId] = streamKey.split(":");
+    // Use the library's full DAVE + WebRTC handshake, not a bare IDENTIFY socket.
+    this.connection = new StreamConnection(streamer, guildId, userId, channelId, () => this.checkHealth());
+    this.connection.serverId = rtcServerId;
+    this.connection.streamKey = streamKey;
+    guardVoiceConnection(this.connection,
+      (code) => onTransportEvent?.(`socket closed (code ${code}); checking recovery...`, "warn"),
+      () => onTransportEvent?.("connection recovered (Discord session + WebRTC verified)", "success"));
+  }
+
+  get isReady() {
+    return !this.isClosed && isMediaConnectionReady(this.connection);
+  }
+
+  updateServer(endpoint, token) {
+    if (this.isClosed) return;
+    this.endpoint = endpoint?.replace(":443", "") || null;
+    this.token = token;
+    this.connection.setTokens(this.endpoint, token);
   }
 
   start() {
-    if (this.isClosed) return;
+    if (this.isClosed || this.healthTimer) return;
     try {
-      this.ws = new WebSocket(`wss://${this.endpoint}/?v=8`);
-
-      this.ws.on("open", () => {
-        // Awaiting HELLO (op 8)
-      });
-
-      this.ws.on("message", (raw) => {
-        try {
-          const packet = JSON.parse(raw.toString("utf-8"));
-          this.handlePacket(packet);
-        } catch {}
-      });
-
-      this.ws.on("error", () => {
-        // Handled via close
-      });
-
-      this.ws.on("close", () => {
-        this.cleanup();
-        if (this.onClose) this.onClose(this.streamKey);
-      });
+      this.connection.setSession(this.sessionId);
+      this.connection.setTokens(this.endpoint, this.token);
+      this.healthTimer = setInterval(() => this.checkHealth(), 1000);
+      this.healthTimer.unref?.();
     } catch {
-      this.cleanup();
-      if (this.onClose) this.onClose(this.streamKey);
+      this.fail("stream watch socket could not start");
     }
   }
 
-  handlePacket(packet) {
-    const { op, d } = packet;
-
-    if (op === VoiceOpCodes.HELLO) {
-      const interval = d.heartbeat_interval || 30000;
-      this.startHeartbeat(interval);
-
-      this.send({
-        op: VoiceOpCodes.IDENTIFY,
-        d: {
-          server_id: this.rtcServerId,
-          user_id: this.userId,
-          session_id: this.sessionId,
-          token: this.token,
-          video: true,
-          streams: [
-            {
-              type: "video",
-              rid: "100",
-              quality: 100,
-            },
-          ],
-        },
-      });
-    } else if (op === VoiceOpCodes.READY) {
-      this.isReady = true;
-      if (this.onReady) this.onReady(this.streamKey);
+  checkHealth() {
+    if (this.isClosed) return;
+    if (shouldReconnectMedia(this.connection)) {
+      this.fail(this.connection.transportHealth.failure || "stream watch transport unavailable");
+    } else if (this.isReady && !this.readyReported) {
+      this.readyReported = true;
+      this.onReady?.(this.streamKey);
     }
   }
 
-  send(data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    }
-  }
-
-  startHeartbeat(interval) {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = setInterval(() => {
-      this.send({
-        op: VoiceOpCodes.HEARTBEAT,
-        d: Date.now(),
-      });
-    }, interval * 0.9);
-  }
-
-  cleanup() {
-    this.isReady = false;
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+  fail(reason) {
+    if (this.isClosed) return;
+    this.stop();
+    this.onClose?.(this.streamKey, reason);
   }
 
   stop() {
     this.isClosed = true;
-    this.cleanup();
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {}
-      this.ws = null;
-    }
+    clearInterval(this.healthTimer);
+    this.healthTimer = null;
+    this.connection.stop();
   }
 }
 
@@ -134,8 +80,11 @@ export class WatcherManager {
     this.channelId = channelId;
     this.dashboard = dashboard;
 
-    this.streamer = new MutedStreamer(client, (type, code) => {
-      this.dashboard?.addLog(`Viewer ${type} socket closed (code ${code})`, "warn");
+    this.streamer = new MutedStreamer(client, (type, code, event) => {
+      this.dashboard?.addLog(event === "recovered"
+        ? `Viewer ${type} connection recovered (Discord session + WebRTC verified)`
+        : `Viewer ${type} socket closed (code ${code}); checking recovery...`,
+      event === "recovered" ? "success" : "warn");
     });
     this.activeSessions = new Map(); // streamKey -> StreamWatchSession
     this.pendingData = new Map(); // streamKey -> { rtcServerId, endpoint, token }
@@ -211,33 +160,45 @@ export class WatcherManager {
   checkAndConnectSession(streamKey) {
     if (!this.isRunning) return;
     const data = this.pendingData.get(streamKey);
+    const existing = this.activeSessions.get(streamKey);
+    if (existing && data) {
+      if (existing.endpoint !== data.endpoint?.replace(":443", "") || existing.token !== data.token) {
+        existing.updateServer(data.endpoint, data.token);
+      }
+      return;
+    }
     if (!data || !data.endpoint || !data.token) return;
-    if (this.activeSessions.has(streamKey)) return;
 
     const rtcServerId = data.rtcServerId
-      || this.streamer.voiceConnection?.streamConnection?.serverId
-      || this.guildId;
+      || this.streamer.voiceConnection?.streamConnection?.serverId;
     if (!rtcServerId) return;
 
     const sessionId = this.sessionId || this.streamer.voiceConnection?.session_id;
     if (!sessionId || !this.client.user) return;
 
     const session = new StreamWatchSession({
+      streamer: this.streamer,
       streamKey,
       endpoint: data.endpoint,
       token: data.token,
       rtcServerId,
       userId: this.client.user.id,
       sessionId,
+      onTransportEvent: (message, level) => {
+        if (this.activeSessions.get(streamKey) !== session) return;
+        this.dashboard?.addLog(`Viewer stream watch ${message}`, level);
+        this.updateDashboardStatus();
+      },
       onReady: (key) => {
         if (this.activeSessions.get(key) !== session) return;
         const username = key.split(":").pop();
         this.dashboard?.addLog(`Viewer watching stream: ${username} (RTC connected)`, "success");
         this.updateDashboardStatus();
       },
-      onClose: (key) => {
+      onClose: (key, reason) => {
         if (this.activeSessions.get(key) !== session) return;
         this.activeSessions.delete(key);
+        if (this.isRunning) this.dashboard?.addLog(`Viewer stream watch lost (${reason}); retrying...`, "warn");
         this.updateDashboardStatus();
 
         if (this.isRunning && this.pendingData.has(key)) {
@@ -262,15 +223,16 @@ export class WatcherManager {
       return;
     }
 
-    if (this.activeSessions.has(streamKey) && this.activeSessions.get(streamKey).isReady) {
-      return;
-    }
+    if (this.activeSessions.has(streamKey)) return;
     this.client.ws.broadcast({
       op: 20,
       d: {
         stream_key: streamKey,
       },
     });
+    // A resumed watch request may not emit another STREAM_SERVER_UPDATE.
+    // Reuse the latest credentials while also asking Discord to refresh them.
+    this.checkAndConnectSession(streamKey);
   }
 
   stopSession(streamKey) {
@@ -299,8 +261,7 @@ export class WatcherManager {
   }
 
   isVoiceReady() {
-    const connection = this.streamer.voiceConnection;
-    return !!(connection?.status?.started && connection.ws?.readyState === 1 && connection.webRtcConn?.ready);
+    return isMediaConnectionReady(this.streamer.voiceConnection);
   }
 
   clearStreamSessions() {

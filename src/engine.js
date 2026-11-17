@@ -5,6 +5,7 @@ import { ensureDummyMedia, injectFFmpegPath, getStreamMediaOptions } from "./med
 import { loadStats, saveStats, detectProfileStreamingBadge } from "./storage.js";
 import { TelemetryService } from "./telemetry.js";
 import { WatcherManager } from "./watcher.js";
+import { shouldReconnectMedia } from "./connection-health.js";
 
 export class StreamEngine {
   constructor(config, dashboard) {
@@ -33,8 +34,11 @@ export class StreamEngine {
         user: s.user,
         token: s.token,
         client: client,
-        streamer: new MutedStreamer(client, (type, code) => {
-          this.dashboard.addLog(`Streamer ${s.user.username} ${type} socket closed (code ${code})`, "warn");
+        streamer: new MutedStreamer(client, (type, code, event) => {
+          this.dashboard.addLog(event === "recovered"
+            ? `Streamer ${s.user.username} ${type} connection recovered (Discord session + WebRTC verified)`
+            : `Streamer ${s.user.username} ${type} socket closed (code ${code}); checking recovery...`,
+          event === "recovered" ? "success" : "warn");
         }),
         telemetry: new TelemetryService(s.token, s.user),
         isStreaming: false,
@@ -148,13 +152,13 @@ export class StreamEngine {
     for (const streamer of this.streamers) {
       if (streamer.isStreaming && !streamer.isStartingBroadcast && !streamer.reconnectTimer) {
         const voiceConn = streamer.streamer?.voiceConnection;
-        if (voiceConn?.awaitingVoiceServer) continue;
         const streamConn = voiceConn?.streamConnection;
-        const isStreamDead = !streamConn || (streamConn.ws && streamConn.ws.readyState > 1);
-        const isVoiceDead = !voiceConn || voiceConn.status?.started === false;
+        const isStreamDead = shouldReconnectMedia(streamConn);
+        const isVoiceDead = shouldReconnectMedia(voiceConn);
 
         if (isStreamDead || isVoiceDead) {
-          this.dashboard.addLog(`Stream watchdog: ${streamer.user.username} stream stalled! Recovering...`, "warn");
+          const reason = voiceConn?.transportHealth?.failure || streamConn?.transportHealth?.failure || "media transport unavailable";
+          this.dashboard.addLog(`Stream watchdog: ${streamer.user.username} ${reason}. Reconnecting...`, "warn");
           streamer.isStreaming = false;
           streamer.streamCancelController?.abort();
           this.scheduleStreamerReconnect(streamer, 2000);
@@ -162,9 +166,8 @@ export class StreamEngine {
       }
     }
 
-    const viewerWaitingForServer = this.viewerManager.streamer.voiceConnection?.awaitingVoiceServer;
-    if (!this.viewerManager.isJoining && !this.viewerReconnectTimer && !viewerWaitingForServer &&
-        !this.viewerManager.isVoiceReady()) {
+    const viewerConnection = this.viewerManager.streamer.voiceConnection;
+    if (!this.viewerManager.isJoining && !this.viewerReconnectTimer && shouldReconnectMedia(viewerConnection)) {
       this.dashboard.addLog("Viewer watchdog: voice connection lost. Reconnecting...", "warn");
       this.dashboard.setViewerStatus("Reconnecting...");
       this.scheduleViewerReconnect(5000, true);
@@ -223,8 +226,7 @@ export class StreamEngine {
 
     this.viewerReconnectTimer = setTimeout(() => {
       this.viewerReconnectTimer = null;
-      if (this.viewerManager.streamer.voiceConnection?.awaitingVoiceServer) return;
-      if (onlyIfUnhealthy && this.viewerManager.isVoiceReady()) return;
+      if (onlyIfUnhealthy && !shouldReconnectMedia(this.viewerManager.streamer.voiceConnection)) return;
       if (this.isRunning) {
         this.startViewerWatcher();
       }

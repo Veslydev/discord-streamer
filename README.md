@@ -99,6 +99,18 @@ pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
+To restore the saved process list after a server reboot, run `pm2 startup` and
+execute the system-specific command it prints, then run `pm2 save` again.
+On systemd hosts, verify the generated `pm2-<user>` service is enabled. After
+changing the process configuration, run `pm2 save` to update the boot snapshot.
+
+Voice and stream sockets verify Discord's session confirmation, WebRTC readiness,
+and heartbeat acknowledgements. Transient socket failures use bounded resume
+backoff; recovery that stalls for 30 seconds triggers a fresh voice join. Logs
+report verified recovery rather than assuming an open socket means success.
+Stream watchers use the same DAVE-capable WebRTC implementation as broadcasters;
+a bare voice IDENTIFY socket is not sufficient for E2EE-required streams.
+
 Use `bun install` for this deployment: it applies the checked-in dependency
 patches in `patches/`. These prevent CPU spinning on full media queues and close
 native demuxers, packet buffers, and playback sinks when a broadcast is cancelled.

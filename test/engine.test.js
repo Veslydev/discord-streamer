@@ -88,7 +88,9 @@ function createWatchdog({ healthy = false, joining = false, waitingForServer = f
     streamers: [],
     viewerReconnectTimer: null,
     viewerManager: {
-      streamer: { voiceConnection: { awaitingVoiceServer: waitingForServer } },
+      streamer: { voiceConnection: {
+        transportHealth: { check: () => waitingForServer ? "recovering" : healthy ? "healthy" : "failed" },
+      } },
       isJoining: joining,
       isVoiceReady: () => healthy,
       getWatchingCount: () => 0,
@@ -164,4 +166,28 @@ test("real moves and disconnects still cancel the old broadcast and recover", ()
     expect(event.streamer.isStreaming).toBe(false);
     expect(event.streamer.streamCancelController.signal.aborted).toBe(true);
   }
+});
+
+test.each(["recovering", "failed"])("stream watchdog respects transport health: %s", (state) => {
+  const watchdog = createWatchdog({ healthy: true });
+  const retries = [];
+  const controller = new AbortController();
+  const streamer = {
+    isStreaming: true,
+    user: { username: "test" },
+    client: { user: {} },
+    streamCancelController: controller,
+    streamer: { voiceConnection: {
+      transportHealth: { check: () => "healthy" },
+      streamConnection: {
+        ws: { readyState: 1 }, webRtcConn: { ready: true },
+        transportHealth: { check: () => state, failure: state === "failed" ? "heartbeat ACK timed out" : null },
+      },
+    } },
+  };
+  watchdog.engine.streamers = [streamer];
+  watchdog.engine.scheduleStreamerReconnect = (_, delay) => retries.push(delay);
+  watchdog.check();
+  expect(retries).toEqual(state === "failed" ? [2000] : []);
+  expect(controller.signal.aborted).toBe(state === "failed");
 });
