@@ -1,0 +1,263 @@
+diff --git a/dist/media/LibavDemuxer.js b/dist/media/LibavDemuxer.js
+index dceb23e11034c341ebf0d61249fffc371920c965..b560c41188a8609b1c51ca214f8d9fee8d342bad 100644
+--- a/dist/media/LibavDemuxer.js
++++ b/dist/media/LibavDemuxer.js
+@@ -51,7 +51,8 @@ function parseOpusPacketDuration(frame) {
+     }
+     return frameSize * frameCount;
+ }
+-export async function demux(input, { format }) {
++export async function demux(input, { format, signal }) {
++    signal?.throwIfAborted();
+     const loggerFormat = new Log("demux:format");
+     const loggerFrameCommon = new Log("demux:frame:common");
+     const loggerFrameVideo = new Log("demux:frame:video");
+@@ -63,16 +64,45 @@ export async function demux(input, { format }) {
+         },
+         format,
+         bufferSize: 8192,
++        signal,
+     });
+-    const cleanup = () => {
++    let stopped = false;
++    let readTask;
++    let closing;
++    const discard = (pipe) => {
++        pipe.unpipe();
++        let packet;
++        while ((packet = pipe.read()) !== null)
++            packet.free();
++        pipe.destroy();
++    };
++    const onAbort = () => cleanup(true);
++    const cleanup = (destroy = false) => {
++        if (destroy) {
++            discard(vPipe);
++            discard(aPipe);
++        }
++        if (stopped)
++            return closing;
++        stopped = true;
++        signal?.removeEventListener("abort", onAbort);
+         input.destroy();
+-        demuxer.close();
+-        vPipe.off("drain", readFrame);
+-        aPipe.off("drain", readFrame);
++        demuxer.interrupt();
++        if (readFrame) {
++            vPipe.off("drain", readFrame);
++            aPipe.off("drain", readFrame);
++        }
+         vPipe.end();
+         aPipe.end();
+-        for (const el of vbsf)
+-            el.close();
++        // A filter may still be in use by the current async read.
++        closing = Promise.resolve().then(async () => {
++            await readTask;
++            for (const el of vbsf)
++                el.close();
++            await demuxer.close();
++        });
++        closing.catch(() => {});
++        return closing;
+     };
+     const vStream = demuxer.video();
+     const aStream = demuxer.audio();
+@@ -87,6 +117,7 @@ export async function demux(input, { format }) {
+         writableHighWaterMark: 128,
+     });
+     const vbsf = [];
++    let readFrame;
+     if (vStream) {
+         const codecId = vStream.codecpar.codecId;
+         if (!allowedVideoCodec.has(codecId)) {
+@@ -173,11 +204,18 @@ export async function demux(input, { format }) {
+         }
+         return packets;
+     };
+-    const readFrame = pDebounce.promise(async () => {
++    readFrame = pDebounce.promise(() => {
++        if (stopped)
++            return;
++        readTask = (async () => {
+         let resume = true;
+-        while (resume) {
++        while (resume && !stopped) {
+             try {
+                 const { value: inPacket, done } = await packetIterator.next();
++                if (stopped) {
++                    inPacket?.free();
++                    return;
++                }
+                 if (done) {
+                     loggerFrameCommon.info("Reached end of stream. Stopping");
+                     const packets = await applyBitStreamFilters(null, vbsf);
+@@ -194,8 +232,12 @@ export async function demux(input, { format }) {
+                         loggerFrameVideo.trace("Received a video packet");
+                         const packets = await applyBitStreamFilters(inPacket.clone(), vbsf);
+                         for (const packet of packets) {
+-                            if (packet)
+-                                resume &&= vPipe.write(packet);
++                            if (packet && stopped)
++                                packet.free();
++                            else if (packet) {
++                                const accepted = vPipe.write(packet);
++                                resume = accepted && resume;
++                            }
+                         }
+                     }
+                     else if (aInfo && aInfo.index === streamIndex) {
+@@ -207,22 +249,24 @@ export async function demux(input, { format }) {
+                 }
+             }
+             catch (e) {
++                if (stopped)
++                    return;
+                 loggerFrameCommon.info({ error: e }, "Received an error during frame extraction. Stopping");
+                 cleanup();
+                 return;
+             }
+         }
++        })();
++        return readTask;
+     });
+-    vPipe.on("drain", () => {
+-        loggerFrameVideo.trace("Video pipe drained");
+-        readFrame();
+-    });
+-    aPipe.on("drain", () => {
+-        loggerFrameAudio.trace("Audio pipe drained");
+-        readFrame();
+-    });
++    vPipe.on("drain", readFrame);
++    aPipe.on("drain", readFrame);
++    signal?.addEventListener("abort", onAbort, { once: true });
++    if (signal?.aborted)
++        onAbort();
+     readFrame();
+     return {
++        close: () => cleanup(true),
+         video: vInfo ? { ...vInfo, stream: vPipe } : undefined,
+         audio: aInfo ? { ...aInfo, stream: aPipe } : undefined,
+     };
+diff --git a/dist/media/newApi.js b/dist/media/newApi.js
+index 01d353bb9d8f2e005699a4dd325cea9e8f76b98f..1ff993312b440d116ce2a2636a9bd190c98ded27 100644
+--- a/dist/media/newApi.js
++++ b/dist/media/newApi.js
+@@ -274,13 +274,21 @@ export async function playStream(input, streamer, options = {}, cancelSignal) {
+     const mergedOptions = mergeOptions(options);
+     logger.debug({ options: mergedOptions }, "Merged options");
+     logger.debug("Initializing demuxer");
+-    const { video, audio } = await demux(input, {
++    const { video, audio, close } = await demux(input, {
+         format: mergedOptions.format,
++        signal: cancelSignal,
+     });
++    const cleanupFuncs = [];
++    let onAbort;
++    const aborted = new Promise((_, reject) => {
++        onAbort = () => reject(cancelSignal.reason);
++        cancelSignal?.addEventListener("abort", onAbort, { once: true });
++    });
++    aborted.catch(() => {});
++    try {
+     cancelSignal?.throwIfAborted();
+     if (!video)
+         throw new Error("No video stream in media");
+-    const cleanupFuncs = [];
+     const videoCodecMap = {
+         [AVCodecID.AV_CODEC_ID_H264]: "H264",
+         [AVCodecID.AV_CODEC_ID_H265]: "H265",
+@@ -291,14 +299,27 @@ export async function playStream(input, streamer, options = {}, cancelSignal) {
+     let conn;
+     let stopStream;
+     if (mergedOptions.type === "go-live") {
+-        conn = await streamer.createStream();
+-        stopStream = () => streamer.stopStream();
++        const voice = streamer.voiceConnection;
++        const creating = streamer.createStream();
++        const ownedStream = voice.streamConnection;
++        stopStream = () => {
++            if (streamer.voiceConnection === voice && voice.streamConnection === ownedStream)
++                streamer.stopStream();
++        };
++        cleanupFuncs.push(stopStream);
++        conn = await Promise.race([creating, aborted]);
+     }
+     else {
+         conn = streamer.voiceConnection.webRtcConn;
+         streamer.signalVideo(true);
+         stopStream = () => streamer.signalVideo(false);
++        cleanupFuncs.push(stopStream);
+     }
++    cancelSignal?.throwIfAborted();
++    cleanupFuncs.push(() => {
++        conn.mediaConnection.setSpeaking(false);
++        conn.mediaConnection.setVideoAttributes(false);
++    });
+     conn.setPacketizer(videoCodecMap[video.codec]);
+     conn.mediaConnection.setSpeaking(true);
+     const { width, height, frameRate } = mergedOptions;
+@@ -308,9 +329,17 @@ export async function playStream(input, streamer, options = {}, cancelSignal) {
+         fps: Math.round(typeof frameRate === "function" ? frameRate(video) : frameRate),
+     });
+     const vStream = new VideoStream(conn);
++    cleanupFuncs.push(() => {
++        video.stream.unpipe(vStream);
++        vStream.destroy();
++    });
+     video.stream.pipe(vStream);
+     if (audio) {
+         const aStream = new AudioStream(conn);
++        cleanupFuncs.push(() => {
++            audio.stream.unpipe(aStream);
++            aStream.destroy();
++        });
+         audio.stream.pipe(aStream);
+         vStream.syncStream = aStream;
+         const burstTime = mergedOptions.readrateInitialBurst;
+@@ -375,31 +404,19 @@ export async function playStream(input, streamer, options = {}, cancelSignal) {
+         })();
+     }
+     const promise = new Promise((resolve, reject) => {
+-        cleanupFuncs.push(() => {
+-            stopStream();
+-            conn.mediaConnection.setSpeaking(false);
+-            conn.mediaConnection.setVideoAttributes(false);
+-        });
+-        let cleanedUp = false;
+-        const cleanup = () => {
+-            if (cleanedUp)
+-                return;
+-            cleanedUp = true;
+-            for (const f of cleanupFuncs)
+-                f();
+-        };
+-        cancelSignal?.addEventListener("abort", () => {
+-            cleanup();
+-            reject(cancelSignal.reason);
+-        }, { once: true });
+-        vStream.once("finish", () => {
+-            if (cancelSignal?.aborted)
+-                return;
+-            cleanup();
+-            resolve();
+-        });
++        vStream.once("finish", resolve);
++        vStream.once("error", reject);
++        video.stream.once("error", reject);
++        audio?.stream.once("error", reject);
+     });
+     promise.catch(() => { });
+-    return promise;
++    await Promise.race([promise, aborted]);
++    } finally {
++        cancelSignal?.removeEventListener("abort", onAbort);
++        for (const cleanup of cleanupFuncs.reverse()) {
++            try { cleanup(); } catch {}
++        }
++        await close();
++    }
+ }
+ //# sourceMappingURL=newApi.js.map

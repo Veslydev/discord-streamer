@@ -119,3 +119,49 @@ test.each([
   watchdog.check();
   expect(watchdog.retries).toEqual([]);
 });
+
+function createVoiceEvent() {
+  const retries = [];
+  const streamer = {
+    user: { id: "self", username: "test" },
+    isStreaming: true,
+    streamCancelController: new AbortController(),
+  };
+  const engine = {
+    isRunning: true,
+    config: { GUILD_ID: "target-guild", CHANNEL_ID: "target-channel" },
+    dashboard: { addLog() {} },
+    scheduleStreamerReconnect: (_, delay) => retries.push(delay),
+    triggerViewerWatch() {},
+    syncDashboardStreamers() {},
+  };
+  const dispatch = (guild, before, after) => StreamEngine.prototype.handleStreamerVoiceState.call(
+    engine, streamer, { channelId: before }, { id: "self", guild: { id: guild }, channelId: after }
+  );
+  return { streamer, retries, dispatch };
+}
+
+test("voice activity in another guild cannot cancel the broadcast", () => {
+  const event = createVoiceEvent();
+  event.dispatch("other-guild", "other-channel", null);
+  event.dispatch("other-guild", null, "other-channel");
+  expect(event.retries).toEqual([]);
+  expect(event.streamer.isStreaming).toBe(true);
+  expect(event.streamer.streamCancelController.signal.aborted).toBe(false);
+});
+
+test("mute updates while outside the channel do not repeatedly reconnect", () => {
+  const event = createVoiceEvent();
+  event.dispatch("target-guild", "other-channel", "other-channel");
+  expect(event.retries).toEqual([]);
+});
+
+test("real moves and disconnects still cancel the old broadcast and recover", () => {
+  for (const [channel, delay] of [[null, 5000], ["other-channel", 3000]]) {
+    const event = createVoiceEvent();
+    event.dispatch("target-guild", "target-channel", channel);
+    expect(event.retries).toEqual([delay]);
+    expect(event.streamer.isStreaming).toBe(false);
+    expect(event.streamer.streamCancelController.signal.aborted).toBe(true);
+  }
+});

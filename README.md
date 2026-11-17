@@ -99,6 +99,12 @@ pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
+Use `bun install` for this deployment: it applies the checked-in dependency
+patches in `patches/`. These prevent CPU spinning on full media queues and close
+native demuxers, packet buffers, and playback sinks when a broadcast is cancelled.
+`npm install` does not apply these Bun patches. Run `bun test` to check the fixes,
+including repeated playback cancellation with real FFmpeg input.
+
 Configure `.env` using `.env.example` before starting. If configuration is missing,
 the PM2 process stops instead of opening the interactive wizard or restarting repeatedly.
 After filling in `.env`, run:

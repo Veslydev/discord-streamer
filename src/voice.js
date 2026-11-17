@@ -1,7 +1,7 @@
 import { Streamer } from "@dank074/discord-video-stream";
 
 // Upstream accepts null endpoints and resumes sockets even after stop().
-export function guardVoiceConnection(connection) {
+export function guardVoiceConnection(connection, onClose) {
   if (!connection || connection.lifecycleGuarded) return;
   connection.lifecycleGuarded = true;
   connection.awaitingVoiceServer = false;
@@ -28,7 +28,14 @@ export function guardVoiceConnection(connection) {
 
   connection.start = () => {
     if (stopped || connection.awaitingVoiceServer || !connection.server || !connection.token) return;
-    return start();
+    const oldSocket = connection.ws;
+    const result = start();
+    if (connection.ws && connection.ws !== oldSocket) {
+      connection.ws.addEventListener("close", (event) => {
+        if (!stopped && !connection.awaitingVoiceServer) onClose?.(event.code);
+      }, { once: true });
+    }
+    return result;
   };
 
   connection.stop = () => {
@@ -65,6 +72,7 @@ export function guardVoiceConnection(connection) {
 export async function leaveVoiceAndWait(streamer, timeoutMs = 5000) {
   if (!streamer.voiceConnection) return;
 
+  const guildId = streamer.voiceConnection.guildId;
   const { client } = streamer;
   let onRaw;
   let timeout;
@@ -72,7 +80,8 @@ export async function leaveVoiceAndWait(streamer, timeoutMs = 5000) {
     await new Promise((resolve, reject) => {
       onRaw = (packet) => {
         if (packet.t === "VOICE_STATE_UPDATE" &&
-            packet.d?.user_id === client.user?.id && packet.d?.channel_id === null) {
+            packet.d?.user_id === client.user?.id && packet.d?.channel_id === null &&
+            (packet.d?.guild_id ?? null) === (guildId ?? null)) {
           resolve();
         }
       };
@@ -127,15 +136,31 @@ export async function waitForStreamReady(streamer, signal, timeoutMs = 20000) {
 }
 
 export class MutedStreamer extends Streamer {
+  constructor(client, onConnectionClose) {
+    super(client);
+    this.onConnectionClose = onConnectionClose;
+  }
+
   joinVoice(guildId, channelId) {
+    const previousListeners = new Set(this._gatewayEmitter.listeners("VOICE_STATE_UPDATE"));
     const joining = super.joinVoice(guildId, channelId);
-    guardVoiceConnection(this.voiceConnection);
+    // Upstream matches only user_id: another guild can otherwise replace our session.
+    for (const listener of this._gatewayEmitter.listeners("VOICE_STATE_UPDATE")) {
+      if (previousListeners.has(listener)) continue;
+      this._gatewayEmitter.off("VOICE_STATE_UPDATE", listener);
+      this._gatewayEmitter.on("VOICE_STATE_UPDATE", (data) => {
+        if ((data.guild_id ?? null) === (guildId ?? null) && data.channel_id === channelId) {
+          listener(data);
+        }
+      });
+    }
+    guardVoiceConnection(this.voiceConnection, (code) => this.onConnectionClose?.("voice", code));
     return joining;
   }
 
   createStream() {
     const creating = super.createStream();
-    guardVoiceConnection(this.voiceConnection?.streamConnection);
+    guardVoiceConnection(this.voiceConnection?.streamConnection, (code) => this.onConnectionClose?.("stream", code));
     return creating;
   }
 

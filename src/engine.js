@@ -33,7 +33,9 @@ export class StreamEngine {
         user: s.user,
         token: s.token,
         client: client,
-        streamer: new MutedStreamer(client),
+        streamer: new MutedStreamer(client, (type, code) => {
+          this.dashboard.addLog(`Streamer ${s.user.username} ${type} socket closed (code ${code})`, "warn");
+        }),
         telemetry: new TelemetryService(s.token, s.user),
         isStreaming: false,
         isStartingBroadcast: false,
@@ -95,28 +97,7 @@ export class StreamEngine {
       });
 
       streamer.client.on("voiceStateUpdate", (oldState, newState) => {
-        if (!this.isRunning || newState.id !== streamer.user.id) return;
-        // A reconnect deliberately leaves first; its acknowledgement is not a new failure.
-        if (streamer.isStartingBroadcast) return;
-
-        if (!newState.channelId) {
-          this.dashboard.addLog(`Streamer ${streamer.user.username} disconnected! Rejoining in 5s...`, "warn");
-          streamer.status = "Rejoining...";
-          streamer.isStreaming = false;
-          if (streamer.streamCancelController) {
-            streamer.streamCancelController.abort();
-          }
-          this.scheduleStreamerReconnect(streamer, 5000);
-          this.triggerViewerWatch();
-          this.syncDashboardStreamers();
-        } else if (newState.channelId !== this.config.CHANNEL_ID) {
-          this.dashboard.addLog(`Streamer ${streamer.user.username} moved! Returning...`, "warn");
-          if (streamer.streamCancelController) {
-            streamer.streamCancelController.abort();
-          }
-          this.scheduleStreamerReconnect(streamer, 3000);
-          this.syncDashboardStreamers();
-        }
+        this.handleStreamerVoiceState(streamer, oldState, newState);
       });
     }
 
@@ -126,7 +107,8 @@ export class StreamEngine {
     });
 
     this.viewerClient.on("voiceStateUpdate", (oldState, newState) => {
-      if (!this.isRunning || newState.id !== this.viewerClient.user?.id) return;
+      if (!this.isRunning || newState.id !== this.viewerClient.user?.id ||
+          newState.guild?.id !== this.config.GUILD_ID || oldState.channelId === newState.channelId) return;
       if (this.viewerManager.isJoining) return;
 
       if (!newState.channelId) {
@@ -191,6 +173,26 @@ export class StreamEngine {
     const activeStreamers = this.streamers.filter((s) => s.isStreaming && s.client.user);
     if (this.viewerManager.isVoiceReady() && this.viewerManager.getWatchingCount() < activeStreamers.length) {
       this.triggerViewerWatch();
+    }
+  }
+
+  handleStreamerVoiceState(streamer, oldState, newState) {
+    if (!this.isRunning || newState.id !== streamer.user.id ||
+        newState.guild?.id !== this.config.GUILD_ID || oldState.channelId === newState.channelId) return;
+    // Our own leave acknowledgement must not schedule a second reconnect.
+    if (streamer.isStartingBroadcast) return;
+
+    if (!newState.channelId || newState.channelId !== this.config.CHANNEL_ID) {
+      const disconnected = !newState.channelId;
+      this.dashboard.addLog(disconnected
+        ? `Streamer ${streamer.user.username} disconnected! Rejoining in 5s...`
+        : `Streamer ${streamer.user.username} moved! Returning...`, "warn");
+      streamer.status = "Rejoining...";
+      streamer.isStreaming = false;
+      streamer.streamCancelController?.abort();
+      this.scheduleStreamerReconnect(streamer, disconnected ? 5000 : 3000);
+      this.triggerViewerWatch();
+      this.syncDashboardStreamers();
     }
   }
 

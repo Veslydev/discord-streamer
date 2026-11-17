@@ -134,7 +134,9 @@ export class WatcherManager {
     this.channelId = channelId;
     this.dashboard = dashboard;
 
-    this.streamer = new MutedStreamer(client);
+    this.streamer = new MutedStreamer(client, (type, code) => {
+      this.dashboard?.addLog(`Viewer ${type} socket closed (code ${code})`, "warn");
+    });
     this.activeSessions = new Map(); // streamKey -> StreamWatchSession
     this.pendingData = new Map(); // streamKey -> { rtcServerId, endpoint, token }
     this.sessionId = null;
@@ -149,7 +151,8 @@ export class WatcherManager {
       if (!this.isRunning) return;
 
       if (packet.t === "VOICE_STATE_UPDATE") {
-        if (packet.d?.user_id === this.client.user?.id) {
+        if (packet.d?.user_id === this.client.user?.id && packet.d?.guild_id === this.guildId &&
+            packet.d?.channel_id === this.channelId) {
           if (packet.d.session_id) {
             this.sessionId = packet.d.session_id;
           }

@@ -23,6 +23,10 @@
     "node-av",
     "zeromq",
   ],
+  "patchedDependencies": {
+    "@dank074/discord-video-stream@7.0.0": "patches/@dank074%2Fdiscord-video-stream@7.0.0.patch",
+    "node-av@6.1.1": "patches/node-av@6.1.1.patch",
+  },
   "packages": {
     "@dank074/discord-video-stream": ["@dank074/discord-video-stream@7.0.0", "", { "dependencies": { "@lng2004/node-datachannel": "0.33.2-20260825", "@snazzah/davey": "^0.1.12", "debug-level": "^4.1.1", "fluent-ffmpeg-simplified": "^0.1.0", "node-av": "^6.1.1", "p-debounce": "^5.1.0", "sharp": "^0.35.3", "zeromq": "^6.5.0" }, "peerDependencies": { "@lng2004/discord.js-selfbot-v13": "^3.7.2" } }, "sha512-oTCCPR9k/OokL1SqJwyztwPTPTws18qErjjTBv4s0llcEb8auSz0L07V1oIWeappnqHjcuNhw5E98YyFlFn98A=="],
 

@@ -29,3 +29,18 @@ test("reconnecting clears stale stream credentials before closing sessions", () 
   expect(stopped).toBe(true);
   expect(watcher.sessionId).toBe(null);
 });
+
+test("unrelated voice states cannot overwrite the viewer session", () => {
+  const client = new EventEmitter();
+  client.user = { id: "viewer" };
+  const watcher = new WatcherManager(client, "guild", "channel");
+  watcher.isRunning = true;
+  const send = (guild, channel, session) => client.emit("raw", {
+    t: "VOICE_STATE_UPDATE",
+    d: { user_id: "viewer", guild_id: guild, channel_id: channel, session_id: session },
+  });
+  send("guild", "channel", "correct-session");
+  send("other-guild", "other-channel", "wrong-session");
+  send("guild", null, "leave-session");
+  expect(watcher.sessionId).toBe("correct-session");
+});

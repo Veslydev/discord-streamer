@@ -1,0 +1,14 @@
+diff --git a/dist/api/demuxer.js b/dist/api/demuxer.js
+index 8acd8d054d6882777c537343008f0d90a749c7f5..ed079e1d367feaccdf1a2a316d2b47f2f70aedc8 100644
+--- a/dist/api/demuxer.js
++++ b/dist/api/demuxer.js
+@@ -1678,7 +1678,8 @@ export class Demuxer {
+                         if (!queueFull) {
+                             break;
+                         }
+-                        await new Promise(setImmediate);
++                        // A full queue needs backpressure, not a hot event-loop spin.
++                        await new Promise((resolve) => setTimeout(resolve, 5));
+                     }
+                     if (abandoned || !this.demuxThreadActive || this.isClosed) {
+                         packet.unref();

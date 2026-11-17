@@ -223,3 +223,18 @@ test("the streamer applies lifecycle guards to both voice and stream connections
   expect(streamer.voiceConnection.streamConnection.lifecycleGuarded).toBe(true);
   streamer.leaveVoice();
 });
+
+test("another guild or channel cannot overwrite the voice transport session", () => {
+  const { streamer } = createStreamer();
+  streamer.client.user = { id: "self" };
+  streamer.joinVoice("guild", "channel");
+  const send = (guild, channel, session) => streamer.client.emit("raw", {
+    t: "VOICE_STATE_UPDATE",
+    d: { user_id: "self", guild_id: guild, channel_id: channel, session_id: session },
+  });
+  send("guild", "channel", "correct-session");
+  send("other-guild", "other-channel", "wrong-session");
+  send("guild", "other-channel", "also-wrong");
+  expect(streamer.voiceConnection.session_id).toBe("correct-session");
+  streamer.leaveVoice();
+});
